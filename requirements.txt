@@ -1,2 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
+httpx
+python-dotenv
+# Prefer installing `crawl4ai` from PyPI. If unavailable, use the GitHub repo instead.
+crawl4ai
+# fallback:
+# git+https://github.com/unclecode/crawl4ai.git@main
