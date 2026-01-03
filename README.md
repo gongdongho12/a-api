@@ -28,6 +28,16 @@ A structured FastAPI project with MySQL integration, SQLAlchemy ORM, and Pydanti
 
 ### Running the Application
 
+**Using Make (Recommended):**
+```bash
+make run
+```
+To stop the server and force clear the port if needed:
+```bash
+make clean
+```
+
+**Manual:**
 ```bash
 uvicorn app.main:app --reload
 ```
