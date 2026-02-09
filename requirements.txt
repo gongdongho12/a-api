@@ -1,2 +1,7 @@
 fastapi
 uvicorn
+playwright
+playwright-stealth
+trafilatura
+beautifulsoup4
+python-dotenv
