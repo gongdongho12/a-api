@@ -140,6 +140,50 @@ async def search(q: str = Query(..., description="Search query")):
         finally:
             await browser.close()
 
+@app.get("/exchange", tags=["Search"])
+async def exchange(base: str = Query("USD", description="Base currency"), to: str = Query("KRW", description="Target currency")):
+    """Get realtime exchange rate from Investing.com"""
+    pair_map = {
+        "USD/KRW": "https://kr.investing.com/currencies/usd-krw",
+        "EUR/KRW": "https://kr.investing.com/currencies/eur-krw",
+        "SGD/KRW": "https://kr.investing.com/currencies/sgd-krw",
+    }
+    
+    pair = f"{base.upper()}/{to.upper()}"
+    url = pair_map.get(pair)
+    
+    if not url:
+        # Fallback to general search if pair not in map
+        return await search(f"{pair} exchange rate")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        stealth = Stealth()
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        page = await context.new_page()
+        await stealth.apply_stealth_async(page)
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            # Investing.com price selector
+            price_selector = '[data-test="instrument-price-last"]'
+            await page.wait_for_selector(price_selector, timeout=10000)
+            
+            price_text = await page.inner_text(price_selector)
+            # Remove commas and convert to float
+            price = float(price_text.replace(",", ""))
+            
+            return {
+                "pair": pair,
+                "rate": price,
+                "source": "Investing.com",
+                "timestamp": str(asyncio.get_event_loop().time())
+            }
+        except Exception as e:
+            # Fallback to Google Search if Investing.com fails
+            return await search(f"{pair} realtime rate")
+        finally:
+            await browser.close()
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=9001)
