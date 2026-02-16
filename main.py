@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
+from enum import Enum
 import trafilatura
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from playwright_stealth import Stealth
@@ -124,35 +125,274 @@ async def rate_limit_middleware(request: Request, call_next):
         )
     return await call_next(request)
 
+class ScrapeFormat(str, Enum):
+    MARKDOWN = "markdown"
+    JSON = "json"
+    DETAILED = "detailed"
+
 class ScrapeRequest(BaseModel):
     url: str = Field(..., description="The URL of the page to scrape")
     wait_ms: Optional[int] = Field(2000, description="Additional wait time after page load")
-    format: Optional[str] = Field("markdown", description="Output format: 'markdown' or 'json'")
+    format: ScrapeFormat = Field(ScrapeFormat.MARKDOWN, description="Output format: 'markdown', 'json', or 'detailed'")
+    include_links: bool = Field(True, description="Include all links in response")
+    include_images: bool = Field(True, description="Include all images in response")
+    extract_tables: bool = Field(True, description="Extract tables in structured format")
 
 @app.get("/", tags=["General"])
 async def home():
     return {"status": "online", "message": "Firecrawl-lite is ready. Visit /docs for Swagger UI."}
 
-def extract_structured_data(html: str) -> Dict[str, Any]:
+def extract_structured_data(html: str, base_url: str = "") -> Dict[str, Any]:
+    """Extract detailed structured content from HTML"""
     soup = BeautifulSoup(html, 'html.parser')
+    
+    def get_text_safe(element) -> str:
+        """Safely extract clean text from element"""
+        if not element:
+            return ""
+        return element.get_text(strip=True)
+    
+    def extract_links(element) -> List[Dict]:
+        """Extract all links from element with context"""
+        links = []
+        for a in element.find_all('a', href=True):
+            href = a.get('href', '')
+            if href.startswith('#'):
+                continue
+            if href.startswith('/'):
+                href = base_url.rstrip('/') + href
+            links.append({
+                "text": get_text_safe(a),
+                "href": href,
+                "title": a.get('title', '')
+            })
+        return links
+    
+    def extract_images(element) -> List[Dict]:
+        """Extract all images from element"""
+        images = []
+        for img in element.find_all('img'):
+            src = img.get('src', '')
+            if src.startswith('/'):
+                src = base_url.rstrip('/') + src
+            images.append({
+                "src": src,
+                "alt": img.get('alt', ''),
+                "title": img.get('title', ''),
+                "width": img.get('width', ''),
+                "height": img.get('height', '')
+            })
+        return images
+    
+    def extract_table(table) -> Dict:
+        """Extract table with headers and rows"""
+        headers = []
+        th_row = table.find('thead')
+        if th_row:
+            headers = [get_text_safe(th) for th in th_row.find_all(['th', 'td'])]
+        
+        rows = []
+        for tr in table.find_all('tr'):
+            row_data = [get_text_safe(td) for td in tr.find_all(['td', 'th'])]
+            if row_data:
+                rows.append(row_data)
+        
+        return {"headers": headers, "rows": rows}
+    
+    def extract_list(lst) -> List[Dict]:
+        """Extract list items with nested structure"""
+        items = []
+        for li in lst.find_all('li', recursive=False):
+            item_data = {"text": get_text_safe(li), "children": []}
+            
+            # Check for nested lists
+            for sub_list in li.find_all(['ul', 'ol'], recursive=False):
+                nested_type = 'bullet' if sub_list.name == 'ul' else 'numbered'
+                item_data["children"].append({
+                    "type": nested_type,
+                    "items": extract_list(sub_list)
+                })
+            
+            items.append(item_data)
+        return items
+    
+    def extract_content_structure(element, depth: int = 0, max_depth: int = 10) -> List[Dict]:
+        """Recursively extract content structure preserving hierarchy"""
+        if depth > max_depth:
+            return []
+        
+        structure = []
+        content_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote', 'code', 'pre']
+        
+        for child in element.children:
+            if child.name is None:  # NavigableString
+                continue
+            
+            item = {"type": child.name, "depth": depth}
+            
+            if child.name == 'h1':
+                item.update({"text": get_text_safe(child), "level": 1})
+            elif child.name == 'h2':
+                item.update({"text": get_text_safe(child), "level": 2})
+            elif child.name == 'h3':
+                item.update({"text": get_text_safe(child), "level": 3})
+            elif child.name == 'h4':
+                item.update({"text": get_text_safe(child), "level": 4})
+            elif child.name == 'h5':
+                item.update({"text": get_text_safe(child), "level": 5})
+            elif child.name == 'h6':
+                item.update({"text": get_text_safe(child), "level": 6})
+            elif child.name == 'p':
+                item.update({"text": get_text_safe(child)})
+                # Check for links in paragraph
+                links = extract_links(child)
+                if links:
+                    item["links"] = links
+            elif child.name == 'ul':
+                item.update({"type": "bullet_list", "items": extract_list(child)})
+            elif child.name == 'ol':
+                item.update({"type": "numbered_list", "items": extract_list(child)})
+            elif child.name == 'table':
+                item.update(extract_table(child))
+            elif child.name == 'blockquote':
+                item.update({"text": get_text_safe(child), "source": child.get('cite', '')})
+            elif child.name == 'pre':
+                code_elem = child.find('code')
+                item.update({
+                    "content": get_text_safe(child),
+                    "language": code_elem.get('class', [''])[0].replace('language-', '') if code_elem else ""
+                })
+            elif child.name == 'code':
+                if child.parent.name != 'pre':
+                    item.update({"text": get_text_safe(child), "inline": True})
+            elif child.name == 'section':
+                item["type"] = "section"
+                item["heading"] = get_text_safe(child.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
+                item["content"] = extract_content_structure(child, depth + 1, max_depth)
+            elif child.name == 'article':
+                item["type"] = "article"
+                item["heading"] = get_text_safe(child.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
+                item["content"] = extract_content_structure(child, depth + 1, max_depth)
+            elif child.name == 'div':
+                # Check if div has semantic meaning
+                item_id = child.get('id', '')
+                item_class = ' '.join(child.get('class', []))
+                
+                if any(keyword in item_id.lower() or keyword in item_class.lower() for keyword in ['content', 'article', 'post', 'body', 'main', 'text']):
+                    item["type"] = "content_block"
+                    item["identifier"] = item_id or item_class
+                    item["content"] = extract_content_structure(child, depth + 1, max_depth)
+                    structure.append(item)
+                    continue
+                else:
+                    # Skip generic divs but check children
+                    structure.extend(extract_content_structure(child, depth + 1, max_depth))
+                    continue
+            else:
+                # For other tags, extract children
+                structure.extend(extract_content_structure(child, depth + 1, max_depth))
+                continue
+            
+            structure.append(item)
+        
+        return structure
+    
+    def find_main_content(soup) -> BeautifulSoup:
+        """Find main content area"""
+        # Try semantic tags first
+        for selector in ['article', 'main', '[role="main"]']:
+            elem = soup.select_one(selector)
+            if elem:
+                return elem
+        
+        # Try common content containers
+        for selector in ['.content', '.article', '.post-content', '.entry-content', '#content', '#main']:
+            elem = soup.select_one(selector)
+            if elem:
+                return elem
+        
+        # Fallback to body
+        return soup.body or soup
+    
+    # Main extraction
     results = {
         "metadata": {
             "title": soup.title.string if soup.title else "",
             "description": "",
-            "og_image": ""
+            "og_image": "",
+            "og_title": "",
+            "canonical": "",
+            "lang": soup.html.get('lang', '') if soup.html else ""
+        },
+        "header_structure": {
+            "h1": [h.get_text(strip=True) for h in soup.find_all('h1')],
+            "h2": [h.get_text(strip=True) for h in soup.find_all('h2')],
+            "h3": [h.get_text(strip=True) for h in soup.find_all('h3')],
+            "h4": [h.get_text(strip=True) for h in soup.find_all('h4')],
+            "h5": [h.get_text(strip=True) for h in soup.find_all('h5')],
+            "h6": [h.get_text(strip=True) for h in soup.find_all('h6')]
+        },
+        "content": [],
+        "links": [],
+        "images": [],
+        "tables": [],
+        "lists": {
+            "bullet": [],
+            "numbered": []
         },
         "json_ld": []
     }
+    
+    # Extract meta tags
     for meta in soup.find_all("meta"):
         name = meta.get("name") or meta.get("property")
         if name == "description":
-            results["metadata"]["description"] = meta.get("content")
+            results["metadata"]["description"] = meta.get("content", "")
         elif name == "og:image":
-            results["metadata"]["og_image"] = meta.get("content")
+            results["metadata"]["og_image"] = meta.get("content", "")
+        elif name == "og:title":
+            results["metadata"]["og_title"] = meta.get("content", "")
+        elif name == "og:description":
+            results["metadata"]["og_description"] = meta.get("content", "")
+    
+    # Canonical URL
+    canonical = soup.find('link', {'rel': 'canonical'})
+    if canonical:
+        results["metadata"]["canonical"] = canonical.get('href', '')
+    
+    # JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
-            results["json_ld"].append(json.loads(script.string))
+            if script.string:
+                results["json_ld"].append(json.loads(script.string))
         except: pass
+    
+    # Find main content area
+    main_content = find_main_content(soup)
+    
+    # Extract content structure
+    results["content"] = extract_content_structure(main_content)
+    
+    # Extract all links
+    results["links"] = extract_links(soup.body) if soup.body else []
+    
+    # Extract all images
+    results["images"] = extract_images(soup.body) if soup.body else []
+    
+    # Extract tables
+    for table in soup.find_all('table'):
+        results["tables"].append(extract_table(table))
+    
+    # Extract lists
+    for ul in soup.find_all('ul'):
+        results["lists"]["bullet"].append(extract_list(ul))
+    for ol in soup.find_all('ol'):
+        results["lists"]["numbered"].append(extract_list(ol))
+    
+    # Clean up empty lists
+    results["lists"]["bullet"] = [l for l in results["lists"]["bullet"] if l]
+    results["lists"]["numbered"] = [l for l in results["lists"]["numbered"] if l]
+    
     return results
 
 @app.post("/scrape", tags=["Scraping"])
@@ -194,9 +434,33 @@ async def scrape(request: ScrapeRequest):
             
             html_content = await page.content()
             
-            if request.format == "json":
-                data = extract_structured_data(html_content)
-            else:
+            if request.format == ScrapeFormat.JSON or request.format == "json":
+                data = extract_structured_data(html_content, request.url)
+            elif request.format == ScrapeFormat.DETAILED or request.format == "detailed":
+                # Detailed format with comprehensive extraction
+                structured = extract_structured_data(html_content, request.url)
+                markdown_content = trafilatura.extract(
+                    html_content, 
+                    output_format='markdown', 
+                    include_links=True,
+                    include_images=request.include_images,
+                    deduplicate=True
+                ) or "Could not extract content."
+                
+                data = {
+                    "markdown": markdown_content,
+                    "structured": structured,
+                    "title": await page.title(),
+                    "status_code": response.status if response else None,
+                    "html_stats": {
+                        "total_headings": sum(len(structured.get("header_structure", {}).get(f"h{i}", [])) for i in range(1, 7)),
+                        "total_links": len(structured.get("links", [])),
+                        "total_images": len(structured.get("images", [])),
+                        "total_tables": len(structured.get("tables", [])),
+                        "content_blocks": len(structured.get("content", []))
+                    }
+                }
+            else:  # markdown
                 downloaded = trafilatura.extract(
                     html_content, 
                     output_format='markdown', 
@@ -209,6 +473,21 @@ async def scrape(request: ScrapeRequest):
                     "title": await page.title(),
                     "status_code": response.status if response else None
                 }
+            
+            # Filter data based on request flags (for json/detailed)
+            if request.format in [ScrapeFormat.JSON, ScrapeFormat.DETAILED, "json", "detailed"]:
+                if not request.include_links and isinstance(data, dict):
+                    data.pop("links", None)
+                    if "structured" in data:
+                        data["structured"].pop("links", None)
+                if not request.include_images and isinstance(data, dict):
+                    data.pop("images", None)
+                    if "structured" in data:
+                        data["structured"].pop("images", None)
+                if not request.extract_tables and isinstance(data, dict):
+                    data.pop("tables", None)
+                    if "structured" in data:
+                        data["structured"].pop("tables", None)
             
             # Store in cache
             scraping_cache[cache_key] = data
