@@ -142,6 +142,210 @@ class ScrapeRequest(BaseModel):
 async def home():
     return {"status": "online", "message": "Firecrawl-lite is ready. Visit /docs for Swagger UI."}
 
+def extract_structured_markdown(html: str, base_url: str = "") -> Dict[str, Any]:
+    """Extract content as structured markdown blocks"""
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    def html_to_markdown(element) -> str:
+        """Convert HTML element to markdown string"""
+        if not element:
+            return ""
+        
+        # Get text content preserving some formatting
+        text = element.get_text(strip=True)
+        
+        if element.name == 'h1':
+            return f"# {text}\n\n"
+        elif element.name == 'h2':
+            return f"## {text}\n\n"
+        elif element.name == 'h3':
+            return f"### {text}\n\n"
+        elif element.name == 'h4':
+            return f"#### {text}\n\n"
+        elif element.name == 'h5':
+            return f"##### {text}\n\n"
+        elif element.name == 'h6':
+            return f"###### {text}\n\n"
+        elif element.name == 'p':
+            # Convert inline links
+            md_text = ""
+            for child in element.children:
+                if child.name == 'a' and child.get('href'):
+                    href = child.get('href')
+                    link_text = child.get_text(strip=True)
+                    md_text += f"[{link_text}]({href})"
+                elif child.name == 'strong' or child.name == 'b':
+                    md_text += f"**{child.get_text(strip=True)}**"
+                elif child.name == 'em' or child.name == 'i':
+                    md_text += f"*{child.get_text(strip=True)}*"
+                elif child.name == 'code':
+                    md_text += f"`{child.get_text(strip=True)}`"
+                elif child.name == 'br':
+                    md_text += "\n"
+                else:
+                    md_text += str(child) if not hasattr(child, 'get_text') else child.get_text()
+            return f"{md_text}\n\n" if md_text else ""
+        elif element.name == 'ul':
+            md = ""
+            for li in element.find_all('li', recursive=False):
+                text = li.get_text(strip=True)
+                md += f"- {text}\n"
+            return md + "\n"
+        elif element.name == 'ol':
+            md = ""
+            for i, li in enumerate(element.find_all('li', recursive=False), 1):
+                text = li.get_text(strip=True)
+                md += f"{i}. {text}\n"
+            return md + "\n"
+        elif element.name == 'blockquote':
+            text = element.get_text(strip=True)
+            return f"> {text}\n\n"
+        elif element.name == 'pre':
+            code_elem = element.find('code')
+            lang = ""
+            if code_elem and code_elem.get('class'):
+                for cls in code_elem.get('class'):
+                    if cls.startswith('language-'):
+                        lang = cls.replace('language-', '')
+                        break
+            content = code_elem.get_text() if code_elem else element.get_text()
+            return f"```{lang}\n{content}\n```\n\n"
+        elif element.name == 'code':
+            if element.parent.name != 'pre':
+                return f"`{text}`"
+        elif element.name == 'hr':
+            return "---\n\n"
+        elif element.name == 'table':
+            return html_table_to_markdown(element)
+        return ""
+    
+    def html_table_to_markdown(table) -> str:
+        """Convert HTML table to markdown table"""
+        md = []
+        rows = []
+        
+        # Get headers
+        headers = []
+        thead = table.find('thead')
+        if thead:
+            headers = [th.get_text(strip=True) for th in thead.find_all(['th', 'td'])]
+        
+        # Get all rows
+        for tr in table.find_all('tr'):
+            row = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
+            if row:
+                rows.append(row)
+        
+        # If no headers but has rows, use first row as header
+        if not headers and rows:
+            headers = rows.pop(0)
+        
+        if not headers:
+            return ""
+        
+        # Build markdown table
+        md.append("| " + " | ".join(headers) + " |")
+        md.append("|" + "|".join(["---"] * len(headers)) + "|")
+        
+        for row in rows:
+            # Pad row if shorter than headers
+            while len(row) < len(headers):
+                row.append("")
+            md.append("| " + " | ".join(row[:len(headers)]) + " |")
+        
+        return "\n".join(md) + "\n\n"
+    
+    def find_content_elements(soup) -> List:
+        """Find main content elements"""
+        # Try to find main content area
+        main_selectors = ['article', 'main', '[role="main"]', '.content', '.article', '.post-content', '.entry-content']
+        container = None
+        
+        for selector in main_selectors:
+            container = soup.select_one(selector)
+            if container:
+                break
+        
+        if not container:
+            container = soup.body or soup
+        
+        # Get all content elements
+        content_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'blockquote', 'pre', 'hr', 'table']
+        elements = []
+        
+        for tag in content_tags:
+            for elem in container.find_all(tag):
+                # Skip empty elements
+                if elem.get_text(strip=True):
+                    elements.append(elem)
+        
+        return elements
+    
+    # Build structured markdown
+    title = soup.title.string if soup.title else ""
+    content_elements = find_content_elements(soup)
+    
+    # Build blocks
+    blocks = []
+    full_markdown = ""
+    
+    for elem in content_elements:
+        md = html_to_markdown(elem)
+        if md.strip():
+            block = {
+                "type": elem.name,
+                "markdown": md.strip(),
+                "text": elem.get_text(strip=True)
+            }
+            
+            # Add extra metadata based on type
+            if elem.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                block["level"] = int(elem.name[1])
+            elif elem.name == 'a':
+                block["href"] = elem.get('href', '')
+            elif elem.name == 'img':
+                block["src"] = elem.get('src', '')
+                block["alt"] = elem.get('alt', '')
+            
+            blocks.append(block)
+            full_markdown += md
+    
+    # Also extract links and images from the whole document
+    all_links = []
+    all_images = []
+    
+    for a in soup.find_all('a', href=True):
+        href = a.get('href', '')
+        if href.startswith('http'):
+            all_links.append({
+                "text": a.get_text(strip=True),
+                "href": href
+            })
+    
+    for img in soup.find_all('img'):
+        src = img.get('src', '')
+        if src:
+            all_images.append({
+                "src": src,
+                "alt": img.get('alt', '')
+            })
+    
+    return {
+        "title": title,
+        "full_markdown": full_markdown.strip(),
+        "blocks": blocks,
+        "stats": {
+            "total_blocks": len(blocks),
+            "headings": sum(1 for b in blocks if b["type"].startswith('h')),
+            "paragraphs": sum(1 for b in blocks if b["type"] == 'p'),
+            "lists": sum(1 for b in blocks if b["type"] in ['ul', 'ol']),
+            "code_blocks": sum(1 for b in blocks if b["type"] == 'pre'),
+            "tables": sum(1 for b in blocks if b["type"] == 'table')
+        },
+        "links": all_links[:50],  # Limit to 50 links
+        "images": all_images[:20]  # Limit to 20 images
+    }
+
 def extract_structured_data(html: str, base_url: str = "") -> Dict[str, Any]:
     """Extract detailed structured content from HTML"""
     soup = BeautifulSoup(html, 'html.parser')
@@ -460,19 +664,10 @@ async def scrape(request: ScrapeRequest):
                         "content_blocks": len(structured.get("content", []))
                     }
                 }
-            else:  # markdown
-                downloaded = trafilatura.extract(
-                    html_content, 
-                    output_format='markdown', 
-                    include_links=True,
-                    include_images=False,
-                    deduplicate=True
-                )
-                data = {
-                    "markdown": downloaded or "Could not extract content.", 
-                    "title": await page.title(),
-                    "status_code": response.status if response else None
-                }
+            else:  # markdown - now with structure
+                md_data = extract_structured_markdown(html_content, request.url)
+                md_data["status_code"] = response.status if response else None
+                data = md_data
             
             # Filter data based on request flags (for json/detailed)
             if request.format in [ScrapeFormat.JSON, ScrapeFormat.DETAILED, "json", "detailed"]:
